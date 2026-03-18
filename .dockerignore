@@ -1,0 +1,11 @@
+node_modules
+.next
+.git
+data/*.db
+data/*.sqlite
+data/chroma
+*.db
+*.sqlite
+.env
+.env.local
+.DS_Store

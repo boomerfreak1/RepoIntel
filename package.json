@@ -1,0 +1,44 @@
+{
+  "name": "repointel",
+  "version": "1.0.0",
+  "description": "RepoIntel - AI Document Intelligence API. Index docs from GitHub, extract entities & relationships, and query via RAG chat.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "keywords": ["ai", "rag", "document-intelligence", "knowledge-graph", "api", "railway-template"],
+  "author": "",
+  "license": "MIT",
+  "type": "commonjs",
+  "dependencies": {
+    "@carbon/icons-react": "^11.76.0",
+    "@carbon/react": "^1.102.0",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^25.4.0",
+    "@types/papaparse": "^5.5.2",
+    "@types/pdf-parse": "^1.1.5",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "better-sqlite3": "^12.6.2",
+    "chromadb": "^3.3.2",
+    "eslint": "^8.57.1",
+    "eslint-config-next": "^14.2.35",
+    "mammoth": "^1.11.0",
+    "next": "^14.2.35",
+    "papaparse": "^5.5.3",
+    "pdf-parse": "^2.4.5",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "remark": "^15.0.1",
+    "remark-parse": "^11.0.0",
+    "sass": "^1.98.0",
+    "typescript": "^5.9.3",
+    "unified": "^11.0.5",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "tsx": "^4.21.0"
+  }
+}
