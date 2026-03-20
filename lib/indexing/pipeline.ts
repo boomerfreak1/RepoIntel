@@ -16,7 +16,18 @@ import {
   resetCollection,
   deleteDocument,
   createIndexSnapshot,
+  insertEntities,
+  insertEntityRelations,
+  deleteEntitiesByDocumentId,
+  getEntities,
+  getEntitiesWithDocumentPath,
+  getChunkDocumentPathMap,
+  updateSnapshotChangeDelta,
 } from "../storage";
+import type { EntityRow } from "../storage";
+import { extractEntitiesBatch, extractRelations } from "../ai/extractor";
+import type { ExtractedEntity, ExtractedRelation } from "../ai/extractor";
+import { computeChangeDelta, PreviousEntity } from "./differ";
 
 /**
  * Full indexing pipeline: GitHub -> Parse -> Chunk -> Embed -> Store.
@@ -57,6 +68,8 @@ export type ProgressCallback = (progress: IndexProgress) => void;
 export interface IndexResult {
   documentsProcessed: number;
   chunksCreated: number;
+  entitiesExtracted: number;
+  relationsExtracted: number;
   errors: Array<{ file: string; error: string }>;
   duration: number;
 }
@@ -103,6 +116,8 @@ export async function runFullIndex(
   const errors: Array<{ file: string; error: string }> = [];
   let documentsProcessed = 0;
   let chunksCreated = 0;
+  let entitiesExtracted = 0;
+  let relationsExtracted = 0;
 
   const progress = (phase: string, current: number, total: number, message: string) => {
     onProgress?.({ phase, current, total, message });
@@ -129,7 +144,26 @@ export async function runFullIndex(
   // Step 2: Determine which files need processing
   progress("prepare", 0, 1, "Comparing files against existing index...");
 
+  // Snapshot previous entities before clearing (for change delta on force re-index)
+  let previousEntities: PreviousEntity[] = [];
   if (forceFullReindex) {
+    progress("prepare", 0, 1, "Force mode: snapshotting previous entities...");
+    try {
+      const prevRows = getEntitiesWithDocumentPath();
+      previousEntities = prevRows.map((e) => ({
+        id: e.id,
+        entity_type: e.entity_type,
+        content: e.content,
+        status: e.status,
+        owner: e.owner,
+        domain: e.domain,
+        document_path: e.document_path,
+      }));
+      console.log(`[index] Captured ${previousEntities.length} previous entities for change delta`);
+    } catch (err) {
+      console.warn("[index] Failed to snapshot previous entities:", err instanceof Error ? err.message : err);
+    }
+
     progress("prepare", 0, 1, "Force mode: clearing existing index...");
     clearAll();
     await resetCollection();
@@ -154,6 +188,7 @@ export async function runFullIndex(
     const removedDocs = existingDocs.filter((d) => !githubPaths.has(d.path));
     for (const doc of removedDocs) {
       console.log(`[index] Removing deleted file: ${doc.path}`);
+      deleteEntitiesByDocumentId(doc.id);
       deleteChunksByDocumentId(doc.id);
       await deleteDocumentChunks(doc.path);
       deleteDocument(doc.path);
@@ -163,6 +198,7 @@ export async function runFullIndex(
     for (const file of filesToProcess) {
       const existing = existingByPath.get(file.path);
       if (existing) {
+        deleteEntitiesByDocumentId(existing.id);
         deleteChunksByDocumentId(existing.id);
         await deleteDocumentChunks(existing.path);
       }
@@ -179,6 +215,9 @@ export async function runFullIndex(
   );
 
   const embedder = getEmbeddingProvider();
+
+  // Track chunks per document for extraction
+  const docChunksMap = new Map<string, { chunks: Chunk[]; domain: string; docId: number }>();
 
   // Step 3: Fetch, parse, chunk, embed changed files
   for (let i = 0; i < filesToProcess.length; i++) {
@@ -259,6 +298,9 @@ export async function runFullIndex(
         }))
       );
 
+      // Save chunks for entity extraction
+      docChunksMap.set(file.path, { chunks, domain, docId: docRow.id });
+
       chunksCreated += chunks.length;
       documentsProcessed++;
     } catch (error) {
@@ -268,12 +310,144 @@ export async function runFullIndex(
     }
   }
 
+  // Step 4: Entity extraction — runs after all chunks are embedded
+  progress("extract", 0, documentsProcessed, "Starting entity extraction...");
+
+  // Collect all chunks for batch extraction
+  const allChunksForExtraction: Array<{ content: string; tokenEstimate: number; chunkId: string; domain: string }> = [];
+  for (const [filePath, { chunks, domain }] of docChunksMap) {
+    for (const chunk of chunks) {
+      allChunksForExtraction.push({
+        content: chunk.content,
+        tokenEstimate: chunk.tokenEstimate,
+        chunkId: chunk.id,
+        domain,
+      });
+    }
+  }
+
+  try {
+    const entityMap = await extractEntitiesBatch(
+      allChunksForExtraction.map((c) => ({ content: c.content, tokenEstimate: c.tokenEstimate })),
+      (processed, total) => {
+        progress("extract", processed, total, `Extracting entities: ${processed}/${total} chunks`);
+      }
+    );
+
+    // Store extracted entities per chunk
+    for (const [chunkIdx, entities] of entityMap) {
+      if (entities.length === 0) continue;
+      const chunkInfo = allChunksForExtraction[chunkIdx];
+      try {
+        insertEntities(
+          entities.map((e) => ({
+            chunk_id: chunkInfo.chunkId,
+            entity_type: e.entity_type,
+            content: e.content,
+            status: e.status,
+            owner: e.owner,
+            domain: chunkInfo.domain,
+            confidence: e.confidence,
+          }))
+        );
+        entitiesExtracted += entities.length;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[index] Failed to store entities for chunk ${chunkInfo.chunkId}:`, msg);
+        errors.push({ file: chunkInfo.chunkId, error: `Entity storage: ${msg}` });
+      }
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("[index] Entity extraction failed:", msg);
+    errors.push({ file: "(entity-extraction)", error: msg });
+  }
+
+  progress("extract", documentsProcessed, documentsProcessed, `Extracted ${entitiesExtracted} entities`);
+
+  // Step 5: Relation extraction — per domain, capped at 50 entities per batch
+  const MAX_ENTITIES_PER_RELATION_BATCH = 50;
+  const domains = [...new Set(Array.from(docChunksMap.values()).map((d) => d.domain))];
+
+  if (entitiesExtracted > 0 && domains.length > 0) {
+    progress("relations", 0, domains.length, "Starting relation extraction...");
+
+    for (let di = 0; di < domains.length; di++) {
+      const domain = domains[di];
+      progress("relations", di, domains.length, `Extracting relations: ${domain}`);
+
+      try {
+        const domainEntities = getEntities({ domain });
+        // Cap at MAX_ENTITIES_PER_RELATION_BATCH to stay within token limits
+        const entitiesToProcess = domainEntities.slice(0, MAX_ENTITIES_PER_RELATION_BATCH);
+
+        if (entitiesToProcess.length < 2) continue;
+
+        const extractedEntities: ExtractedEntity[] = entitiesToProcess.map((e) => ({
+          entity_type: e.entity_type as ExtractedEntity["entity_type"],
+          content: e.content,
+          status: e.status as ExtractedEntity["status"],
+          owner: e.owner,
+          confidence: e.confidence,
+        }));
+
+        const relations = await extractRelations(extractedEntities);
+
+        if (relations.length > 0) {
+          const relationRows = relations.map((r) => ({
+            source_entity_id: entitiesToProcess[r.source_index].id,
+            target_entity_id: entitiesToProcess[r.target_index].id,
+            relation_type: r.relation_type,
+            confidence: r.confidence,
+          }));
+          insertEntityRelations(relationRows);
+          relationsExtracted += relations.length;
+        }
+
+        console.log(`[index] Domain "${domain}": ${relations.length} relations from ${entitiesToProcess.length} entities`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[index] Relation extraction failed for domain "${domain}":`, msg);
+        errors.push({ file: `(relations:${domain})`, error: msg });
+      }
+    }
+
+    progress("relations", domains.length, domains.length, `Extracted ${relationsExtracted} relations`);
+  }
+
+  // Step 6: Change delta computation (only on force re-index with previous data)
+  let changeDelta: Record<string, unknown> | undefined;
+  if (forceFullReindex && previousEntities.length > 0 && entitiesExtracted > 0) {
+    progress("changes", 0, 1, "Computing change delta...");
+    try {
+      const newEntities = getEntities();
+      const chunkDocPaths = getChunkDocumentPathMap();
+      const delta = await computeChangeDelta(newEntities, chunkDocPaths, previousEntities);
+      changeDelta = delta as unknown as Record<string, unknown>;
+      console.log(`[index] Change delta: ${delta.summary.new} new, ${delta.summary.resolved} resolved, ${delta.summary.modified} modified`);
+      progress("changes", 1, 1, `Changes: ${delta.summary.new} new, ${delta.summary.resolved} resolved, ${delta.summary.modified} modified`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error("[index] Change delta computation failed:", msg);
+      errors.push({ file: "(change-delta)", error: msg });
+    }
+  }
+
   // Create index snapshot
   try {
     const stats = getStats();
-    createIndexSnapshot({
-      entity_summary: { document_count: stats.documentCount, chunk_count: stats.chunkCount },
+    const snapshot = createIndexSnapshot({
+      entity_summary: {
+        document_count: stats.documentCount,
+        chunk_count: stats.chunkCount,
+        entity_count: entitiesExtracted,
+        relation_count: relationsExtracted,
+      },
+      change_delta: changeDelta,
     });
+    if (changeDelta) {
+      updateSnapshotChangeDelta(snapshot.id, changeDelta);
+    }
   } catch (err) {
     console.warn("[index] Failed to create index snapshot:", err instanceof Error ? err.message : err);
   }
@@ -284,10 +458,10 @@ export async function runFullIndex(
     "done",
     supportedFiles.length,
     supportedFiles.length,
-    `Indexed ${documentsProcessed} documents, ${chunksCreated} chunks in ${(duration / 1000).toFixed(1)}s${skippedMsg}`
+    `Indexed ${documentsProcessed} documents, ${chunksCreated} chunks, ${entitiesExtracted} entities, ${relationsExtracted} relations in ${(duration / 1000).toFixed(1)}s${skippedMsg}`
   );
 
-  return { documentsProcessed, chunksCreated, errors, duration };
+  return { documentsProcessed, chunksCreated, entitiesExtracted, relationsExtracted, errors, duration };
 }
 
 /**
@@ -296,7 +470,7 @@ export async function runFullIndex(
 export async function indexFile(
   filePath: string,
   github?: GitHubClient
-): Promise<{ chunks: number }> {
+): Promise<{ chunks: number; entities: number }> {
   const client = github ?? getGitHubClient();
   const embedder = getEmbeddingProvider();
 
@@ -322,6 +496,7 @@ export async function indexFile(
   // Check if document already exists
   const existing = getDocumentByPath(filePath);
   if (existing) {
+    deleteEntitiesByDocumentId(existing.id);
     deleteChunksByDocumentId(existing.id);
     await deleteDocumentChunks(filePath);
   }
@@ -376,5 +551,32 @@ export async function indexFile(
     }))
   );
 
-  return { chunks: chunks.length };
+  // Entity extraction for webhook-indexed file
+  let entityCount = 0;
+  try {
+    const entityMap = await extractEntitiesBatch(
+      chunks.map((c) => ({ content: c.content, tokenEstimate: c.tokenEstimate }))
+    );
+
+    for (const [chunkIdx, entities] of entityMap) {
+      if (entities.length === 0) continue;
+      insertEntities(
+        entities.map((e) => ({
+          chunk_id: chunks[chunkIdx].id,
+          entity_type: e.entity_type,
+          content: e.content,
+          status: e.status,
+          owner: e.owner,
+          domain,
+          confidence: e.confidence,
+        }))
+      );
+      entityCount += entities.length;
+    }
+    console.log(`[index] Single file ${filePath}: ${entityCount} entities extracted`);
+  } catch (err) {
+    console.error(`[index] Entity extraction failed for ${filePath}:`, err instanceof Error ? err.message : err);
+  }
+
+  return { chunks: chunks.length, entities: entityCount };
 }

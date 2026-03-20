@@ -14,6 +14,8 @@ let indexingState: {
     success: boolean;
     documentsProcessed?: number;
     chunksCreated?: number;
+    entitiesExtracted?: number;
+    relationsExtracted?: number;
     errors?: Array<{ file: string; error: string }>;
     duration?: string;
     error?: string;

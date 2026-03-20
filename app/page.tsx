@@ -49,6 +49,8 @@ interface IndexResult {
   success: boolean;
   documentsProcessed?: number;
   chunksCreated?: number;
+  entitiesExtracted?: number;
+  relationsExtracted?: number;
   errors?: Array<{ file: string; error: string }>;
   duration?: string;
   error?: string;
@@ -73,6 +75,9 @@ const PHASE_LABELS: Record<string, string> = {
   prepare: "Preparing",
   parse: "Parsing & embedding",
   embed: "Embedding chunks",
+  extract: "Extracting entities",
+  relations: "Extracting relations",
+  changes: "Computing changes",
   done: "Complete",
   start: "Starting",
 };
@@ -345,7 +350,7 @@ export default function DashboardPage() {
                   {indexResult.success ? (
                     <>
                       <strong>Indexing complete.</strong>{" "}
-                      {indexResult.documentsProcessed} documents, {indexResult.chunksCreated} chunks in {indexResult.duration}
+                      {indexResult.documentsProcessed} documents, {indexResult.chunksCreated} chunks, {indexResult.entitiesExtracted ?? 0} entities, {indexResult.relationsExtracted ?? 0} relations in {indexResult.duration}
                     </>
                   ) : (
                     <><strong style={{ color: "var(--cds-support-error)" }}>Error:</strong> {indexResult.error}</>
