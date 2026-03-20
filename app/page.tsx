@@ -73,6 +73,9 @@ const PHASE_LABELS: Record<string, string> = {
   prepare: "Preparing",
   parse: "Parsing & embedding",
   embed: "Embedding chunks",
+  extract: "Extracting entities",
+  relations: "Extracting relations",
+  changes: "Computing changes",
   done: "Complete",
   start: "Starting",
 };

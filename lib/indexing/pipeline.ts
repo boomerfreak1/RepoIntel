@@ -1,8 +1,10 @@
 import fs from "fs";
 import { GitHubClient, getGitHubClient } from "../github";
 import { parseDocument, isSupported } from "../parsers";
-import { chunkDocument, Chunk } from "./chunker";
+import { chunkDocument } from "./chunker";
 import { getEmbeddingProvider } from "../embeddings";
+import { extractEntitiesBatch, extractRelations, type ExtractedEntity } from "../ai/extractor";
+import { computeChangeDelta, PreviousEntity } from "./differ";
 import {
   upsertDocument,
   insertChunks,
@@ -16,7 +18,14 @@ import {
   resetCollection,
   deleteDocument,
   createIndexSnapshot,
+  insertEntities,
+  insertEntityRelations,
+  getEntitiesWithDocumentPath,
+  getChunkDocumentPathMap,
+  updateSnapshotChangeDelta,
+  deleteEntitiesByDocumentId,
 } from "../storage";
+import type { EntityRow } from "../storage";
 
 /**
  * Full indexing pipeline: GitHub -> Parse -> Chunk -> Embed -> Store.
@@ -57,6 +66,8 @@ export type ProgressCallback = (progress: IndexProgress) => void;
 export interface IndexResult {
   documentsProcessed: number;
   chunksCreated: number;
+  entitiesExtracted: number;
+  relationsExtracted: number;
   errors: Array<{ file: string; error: string }>;
   duration: number;
 }
@@ -103,6 +114,8 @@ export async function runFullIndex(
   const errors: Array<{ file: string; error: string }> = [];
   let documentsProcessed = 0;
   let chunksCreated = 0;
+  let entitiesExtracted = 0;
+  let relationsExtracted = 0;
 
   const progress = (phase: string, current: number, total: number, message: string) => {
     onProgress?.({ phase, current, total, message });
@@ -129,7 +142,22 @@ export async function runFullIndex(
   // Step 2: Determine which files need processing
   progress("prepare", 0, 1, "Comparing files against existing index...");
 
+  // Snapshot previous entities for change delta computation (before clearing)
+  let previousEntities: PreviousEntity[] = [];
   if (forceFullReindex) {
+    try {
+      previousEntities = getEntitiesWithDocumentPath().map((e) => ({
+        id: e.id,
+        entity_type: e.entity_type,
+        content: e.content,
+        status: e.status,
+        owner: e.owner ?? null,
+        domain: e.domain,
+        document_path: e.document_path,
+      }));
+    } catch (err) {
+      console.warn("[index] Failed to snapshot previous entities:", err instanceof Error ? err.message : err);
+    }
     progress("prepare", 0, 1, "Force mode: clearing existing index...");
     clearAll();
     await resetCollection();
@@ -154,6 +182,7 @@ export async function runFullIndex(
     const removedDocs = existingDocs.filter((d) => !githubPaths.has(d.path));
     for (const doc of removedDocs) {
       console.log(`[index] Removing deleted file: ${doc.path}`);
+      deleteEntitiesByDocumentId(doc.id);
       deleteChunksByDocumentId(doc.id);
       await deleteDocumentChunks(doc.path);
       deleteDocument(doc.path);
@@ -163,6 +192,7 @@ export async function runFullIndex(
     for (const file of filesToProcess) {
       const existing = existingByPath.get(file.path);
       if (existing) {
+        deleteEntitiesByDocumentId(existing.id);
         deleteChunksByDocumentId(existing.id);
         await deleteDocumentChunks(existing.path);
       }
@@ -179,6 +209,7 @@ export async function runFullIndex(
   );
 
   const embedder = getEmbeddingProvider();
+  const allNewChunks: Array<{ id: string; content: string; token_estimate: number; domain: string }> = [];
 
   // Step 3: Fetch, parse, chunk, embed changed files
   for (let i = 0; i < filesToProcess.length; i++) {
@@ -259,6 +290,11 @@ export async function runFullIndex(
         }))
       );
 
+      // Collect chunks for extraction
+      for (const c of chunks) {
+        allNewChunks.push({ id: c.id, content: c.content, token_estimate: c.tokenEstimate, domain });
+      }
+
       chunksCreated += chunks.length;
       documentsProcessed++;
     } catch (error) {
@@ -268,12 +304,129 @@ export async function runFullIndex(
     }
   }
 
-  // Create index snapshot
+  // Step 4: Entity extraction
+  if (allNewChunks.length > 0) {
+    try {
+      progress("extract", 0, allNewChunks.length, "Extracting entities from chunks...");
+      const chunkInputs = allNewChunks.map((c) => ({ content: c.content, tokenEstimate: c.token_estimate }));
+      const extractionMap = await extractEntitiesBatch(chunkInputs, (completed) => {
+        progress("extract", completed, allNewChunks.length, `Extracted entities from ${completed}/${allNewChunks.length} chunks`);
+      });
+
+      // Build chunk-to-document-path map for domain attribution
+      const chunkDocPathMap = getChunkDocumentPathMap();
+
+      for (const [chunkIdx, entities] of extractionMap.entries()) {
+        if (entities.length === 0) continue;
+        const chunk = allNewChunks[chunkIdx];
+        const docPath = chunkDocPathMap.get(chunk.id);
+        const domain = chunk.domain;
+
+        const rows = insertEntities(
+          entities.map((e) => ({
+            chunk_id: chunk.id,
+            entity_type: e.entity_type,
+            content: e.content,
+            status: e.status,
+            owner: e.owner ?? null,
+            confidence: e.confidence,
+            domain,
+          }))
+        );
+        entitiesExtracted += rows.length;
+      }
+      console.log(`[index] Extracted ${entitiesExtracted} entities from ${allNewChunks.length} chunks`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn("[index] Entity extraction failed (non-fatal):", msg);
+      errors.push({ file: "entity-extraction", error: msg });
+    }
+  }
+
+  // Step 5: Relation extraction (grouped by domain, capped at 50 entities per batch)
+  if (entitiesExtracted > 0) {
+    try {
+      progress("relations", 0, 1, "Extracting relations between entities...");
+      const allEntities = getEntitiesWithDocumentPath();
+      const byDomain = new Map<string, EntityRow[]>();
+      for (const e of allEntities) {
+        const domain = e.domain ?? "general";
+        if (!byDomain.has(domain)) byDomain.set(domain, []);
+        byDomain.get(domain)!.push(e);
+      }
+
+      let domainIdx = 0;
+      for (const [domain, domainEntities] of byDomain) {
+        progress("relations", domainIdx, byDomain.size, `Extracting relations for domain: ${domain}`);
+        // Cap at 50 entities per batch to stay within token limits
+        const batch = domainEntities.slice(0, 50);
+        try {
+          const relations = await extractRelations(
+            batch.map((e) => ({
+              entity_type: e.entity_type as ExtractedEntity["entity_type"],
+              content: e.content,
+              status: e.status as ExtractedEntity["status"],
+              owner: e.owner ?? null,
+              confidence: e.confidence,
+            }))
+          );
+
+          if (relations.length > 0) {
+            insertEntityRelations(
+              relations.map((r) => ({
+                source_entity_id: batch[r.source_index]?.id,
+                target_entity_id: batch[r.target_index]?.id,
+                relation_type: r.relation_type,
+                confidence: r.confidence,
+              })).filter((r) => r.source_entity_id && r.target_entity_id)
+            );
+            relationsExtracted += relations.length;
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.warn(`[index] Relation extraction failed for domain ${domain} (non-fatal):`, msg);
+          errors.push({ file: `relations-${domain}`, error: msg });
+        }
+        domainIdx++;
+      }
+      console.log(`[index] Extracted ${relationsExtracted} relations across ${byDomain.size} domains`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn("[index] Relation extraction failed (non-fatal):", msg);
+      errors.push({ file: "relation-extraction", error: msg });
+    }
+  }
+
+  // Step 6: Create index snapshot and compute change delta
   try {
     const stats = getStats();
-    createIndexSnapshot({
-      entity_summary: { document_count: stats.documentCount, chunk_count: stats.chunkCount },
+    const snapshot = createIndexSnapshot({
+      entity_summary: {
+        document_count: stats.documentCount,
+        chunk_count: stats.chunkCount,
+        entity_count: entitiesExtracted,
+        relation_count: relationsExtracted,
+      },
     });
+
+    if (previousEntities.length > 0) {
+      try {
+        progress("changes", 0, 1, "Computing change delta...");
+        const currentEntities = getEntitiesWithDocumentPath();
+        const docPathMap = getChunkDocumentPathMap();
+        const changeDelta = await computeChangeDelta(
+          currentEntities,
+          docPathMap,
+          previousEntities
+        );
+        updateSnapshotChangeDelta(snapshot.id, changeDelta as unknown as Record<string, unknown>);
+        progress("changes", 1, 1, `Change delta: ${changeDelta.summary?.new ?? 0} new, ${changeDelta.summary?.resolved ?? 0} resolved, ${changeDelta.summary?.modified ?? 0} modified`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn("[index] Change delta computation failed (non-fatal):", msg);
+        errors.push({ file: "change-delta", error: msg });
+      }
+    }
   } catch (err) {
     console.warn("[index] Failed to create index snapshot:", err instanceof Error ? err.message : err);
   }
@@ -284,10 +437,10 @@ export async function runFullIndex(
     "done",
     supportedFiles.length,
     supportedFiles.length,
-    `Indexed ${documentsProcessed} documents, ${chunksCreated} chunks in ${(duration / 1000).toFixed(1)}s${skippedMsg}`
+    `Indexed ${documentsProcessed} documents, ${chunksCreated} chunks, ${entitiesExtracted} entities, ${relationsExtracted} relations in ${(duration / 1000).toFixed(1)}s${skippedMsg}`
   );
 
-  return { documentsProcessed, chunksCreated, errors, duration };
+  return { documentsProcessed, chunksCreated, entitiesExtracted, relationsExtracted, errors, duration };
 }
 
 /**
@@ -296,7 +449,7 @@ export async function runFullIndex(
 export async function indexFile(
   filePath: string,
   github?: GitHubClient
-): Promise<{ chunks: number }> {
+): Promise<{ chunks: number; entities: number }> {
   const client = github ?? getGitHubClient();
   const embedder = getEmbeddingProvider();
 
@@ -322,6 +475,7 @@ export async function indexFile(
   // Check if document already exists
   const existing = getDocumentByPath(filePath);
   if (existing) {
+    deleteEntitiesByDocumentId(existing.id);
     deleteChunksByDocumentId(existing.id);
     await deleteDocumentChunks(filePath);
   }
@@ -376,5 +530,30 @@ export async function indexFile(
     }))
   );
 
-  return { chunks: chunks.length };
+  // Extract entities from new chunks (non-fatal)
+  let entityCount = 0;
+  try {
+    const chunkInputs = chunks.map((c) => ({ content: c.content, tokenEstimate: c.tokenEstimate }));
+    const extractionMap = await extractEntitiesBatch(chunkInputs);
+    for (const [chunkIdx, entities] of extractionMap.entries()) {
+      if (entities.length === 0) continue;
+      const chunk = chunks[chunkIdx];
+      const rows = insertEntities(
+        entities.map((e) => ({
+          chunk_id: chunk.id,
+          entity_type: e.entity_type,
+          content: e.content,
+          status: e.status,
+          owner: e.owner ?? null,
+          confidence: e.confidence,
+          domain,
+        }))
+      );
+      entityCount += rows.length;
+    }
+  } catch (err) {
+    console.warn(`[index] Entity extraction failed for ${filePath} (non-fatal):`, err instanceof Error ? err.message : err);
+  }
+
+  return { chunks: chunks.length, entities: entityCount };
 }

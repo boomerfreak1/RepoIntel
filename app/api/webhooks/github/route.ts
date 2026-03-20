@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import crypto from "crypto";
 import { isSupported } from "@/lib/parsers";
 import { indexFile } from "@/lib/indexing/pipeline";
-import { deleteDocument } from "@/lib/storage/db";
+import { deleteDocument, getDocumentByPath, deleteEntitiesByDocumentId } from "@/lib/storage/db";
 import { deleteDocumentChunks } from "@/lib/storage/vectorstore";
 
 /**
@@ -122,6 +122,10 @@ export async function POST(request: NextRequest) {
   // Handle removed files
   for (const filePath of removedFiles) {
     try {
+      const doc = getDocumentByPath(filePath);
+      if (doc) {
+        deleteEntitiesByDocumentId(doc.id);
+      }
       deleteDocument(filePath);
       await deleteDocumentChunks(filePath);
       results.removed.push(filePath);

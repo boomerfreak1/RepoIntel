@@ -8,7 +8,7 @@ export const ENTITY_EXTRACTION_PROMPT = `You are an entity extraction system for
 Extract entities of these types:
 - decision: A choice made or proposed (e.g., tool selection, process change, strategic direction)
 - dependency: Something this workflow or process depends on (e.g., another system, team, data source, approval)
-- gap: A missing capability, unknown, or unresolved question (often marked with [GAP] in the text)
+- gap: A missing capability, unknown, unresolved question, or area needing attention. Gaps include: unanswered questions, undefined timelines, missing owners, TBD items, unclear requirements, acknowledged risks without mitigation, areas marked as needing further investigation, incomplete specifications, and any explicit markers like [GAP] or TODO. Look for phrases like "need to determine", "TBD", "to be decided", "not yet defined", "unclear", "unknown", "needs investigation", "open question", "pending", "still need", "has not been", "remains to be seen", "no owner", "unresolved".
 - stakeholder: A person or team mentioned as responsible, involved, or impacted
 - milestone: A target date, deliverable, or phase gate
 - workflow: A named process, pipeline, or operational workflow
@@ -30,11 +30,14 @@ Examples:
 Input: "The team decided to migrate from REST to GraphQL for better query flexibility. Sarah Chen will lead the migration effort."
 Output: {"entities": [{"entity_type": "decision", "content": "Team decided to migrate from REST to GraphQL for better query flexibility", "status": "open", "owner": "Sarah Chen", "confidence": 0.85}, {"entity_type": "stakeholder", "content": "Sarah Chen — leading the REST to GraphQL migration", "status": "unknown", "owner": null, "confidence": 0.95}]}
 
-Input: "[GAP] Who owns the authentication service migration? What is the timeline for the API v2 rollout?"
+Input: "We still need to figure out who owns the authentication service migration. The timeline for the API v2 rollout hasn't been established yet."
 Output: {"entities": [{"entity_type": "gap", "content": "Unknown owner of authentication service migration", "status": "open", "owner": null, "confidence": 0.95}, {"entity_type": "gap", "content": "Timeline for API v2 rollout is undefined", "status": "open", "owner": null, "confidence": 0.9}]}
 
 Input: "The deployment pipeline requires the CI/CD system to pass all integration tests. This depends on the staging environment being available and the database migration scripts being validated."
 Output: {"entities": [{"entity_type": "workflow", "content": "Deployment pipeline — requires CI/CD integration tests to pass before deployment", "status": "open", "owner": null, "confidence": 0.9}, {"entity_type": "dependency", "content": "Requires staging environment availability for deployment pipeline", "status": "unknown", "owner": null, "confidence": 0.85}, {"entity_type": "dependency", "content": "Requires validated database migration scripts for deployment", "status": "unknown", "owner": null, "confidence": 0.85}]}
+
+Input: "The onboarding process is mostly automated but the compliance review step is still manual. TBD whether we integrate with the new compliance API or build an internal solution. Expected completion is Q3 2025."
+Output: {"entities": [{"entity_type": "workflow", "content": "Onboarding process — mostly automated but compliance review step is still manual", "status": "open", "owner": null, "confidence": 0.9}, {"entity_type": "gap", "content": "TBD whether to integrate with new compliance API or build an internal solution for compliance review", "status": "open", "owner": null, "confidence": 0.95}, {"entity_type": "milestone", "content": "Expected completion of compliance review integration is Q3 2025", "status": "open", "owner": null, "confidence": 0.85}]}
 
 Now extract entities from this text:
 `;

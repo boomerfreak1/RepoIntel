@@ -75,7 +75,7 @@ export async function POST(request: NextRequest) {
         ...result,
         duration: `${(result.duration / 1000).toFixed(1)}s`,
       };
-      console.log(`[index] Pipeline complete: ${result.documentsProcessed} docs, ${result.chunksCreated} chunks in ${(result.duration / 1000).toFixed(1)}s`);
+      console.log(`[index] Pipeline complete: ${result.documentsProcessed} docs, ${result.chunksCreated} chunks, ${result.entitiesExtracted} entities, ${result.relationsExtracted} relations in ${(result.duration / 1000).toFixed(1)}s`);
     })
     .catch((error) => {
       indexingState.running = false;

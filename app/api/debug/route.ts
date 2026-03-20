@@ -3,7 +3,7 @@ import { getEntityStats } from "@/lib/storage";
 
 export const dynamic = "force-dynamic";
 
-const TEST_TEXT = `The team decided to migrate from REST to GraphQL for better query flexibility. Sarah Chen will lead the migration effort. [GAP] Who owns the authentication service migration? The deployment pipeline depends on the CI/CD system passing all integration tests.`;
+const TEST_TEXT = `The team decided to migrate from REST to GraphQL for better query flexibility. Sarah Chen will lead the migration effort. We still need to figure out who owns the authentication service migration. The deployment pipeline depends on the CI/CD system passing all integration tests. The timeline for the API v2 rollout hasn't been established yet.`;
 
 /**
  * GET /api/debug — Test extraction pipeline and show entity stats.
